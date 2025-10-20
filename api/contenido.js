@@ -4,14 +4,19 @@ export default async function handler(req, res) {
     const params = new URLSearchParams(req.query).toString();
     const targetUrl = `${baseUrl}?${params}`;
 
-    // Carga del token JWT desde variable de entorno (si existe)
-    const jwt = process.env.JWT_TOKEN ? `Bearer ${process.env.JWT_TOKEN}` : null;
+    // ✅ Reenviar token recibido o usar fallback desde variable de entorno
+    const incomingAuth = req.headers.authorization; // token desde el GPT
+    const fallbackToken = process.env.JWT_TOKEN ? `Bearer ${process.env.JWT_TOKEN}` : null;
+    const jwt = incomingAuth || fallbackToken;
 
     const headers = {
       "User-Agent": "CetGPT-Proxy",
       "Accept": "application/json",
     };
     if (jwt) headers["Authorization"] = jwt;
+
+    // ✅ Log de prueba (temporal) para confirmar si llega el token desde el GPT
+    console.log("Token reenviado:", jwt);
 
     const response = await fetch(targetUrl, { headers });
 
