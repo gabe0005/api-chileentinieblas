@@ -12,8 +12,8 @@ export default async function handler(req, res) {
   } = req.query;
 
   const baseUrl = 'https://chileentinieblas.cl/wp-json/chileentinieblas/v1/contenido';
-
   const url = new URL(baseUrl);
+
   url.searchParams.set('type', type);
   url.searchParams.set('per_page', per_page);
   url.searchParams.set('page', page);
@@ -38,33 +38,34 @@ export default async function handler(req, res) {
 
     const data = await response.json();
 
-    // Si hay búsqueda flexible, aplicarla aquí
-    let results = data;
-
-    if (search) {
-      const searchTerm = search.toLowerCase().trim();
-      results = data.filter((item) => {
-        const title = (item.title || '').toLowerCase();
-        const excerpt = (item.excerpt || '').toLowerCase();
-        const content = (item.content || '').toLowerCase();
-        const slug = (item.slug || '').toLowerCase();
-
-        const acf = item.acf || {};
-        const acfValues = [
-          acf.nombre,
-          acf.nombre_completo,
-          acf.alias,
-        ].map((v) => (v || '').toLowerCase());
-
-        return (
-          title.includes(searchTerm) ||
-          excerpt.includes(searchTerm) ||
-          content.includes(searchTerm) ||
-          slug.includes(searchTerm) ||
-          acfValues.some((val) => val.includes(searchTerm))
-        );
-      });
+    // Si no hay parámetro de búsqueda, devolver los datos sin procesar
+    if (!search) {
+      return res.status(200).json(data);
     }
+
+    // Procesamiento local del filtro
+    const searchTerm = search.toLowerCase().trim();
+    const results = data.filter((item) => {
+      const title = (item.title || '').toLowerCase();
+      const excerpt = (item.excerpt || '').toLowerCase();
+      const content = (item.content || '').toLowerCase();
+      const slug = (item.slug || '').toLowerCase();
+
+      const acf = item.acf || {};
+      const acfValues = [
+        acf.nombre,
+        acf.nombre_completo,
+        acf.alias,
+      ].map((v) => (v || '').toLowerCase());
+
+      return (
+        title.includes(searchTerm) ||
+        excerpt.includes(searchTerm) ||
+        content.includes(searchTerm) ||
+        slug.includes(searchTerm) ||
+        acfValues.some((val) => val.includes(searchTerm))
+      );
+    });
 
     return res.status(200).json(results);
   } catch (err) {
