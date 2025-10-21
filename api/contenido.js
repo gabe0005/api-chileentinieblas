@@ -24,15 +24,15 @@ export async function GET(req = NextRequest) {
 
     const data = await response.json();
 
-    // 🔍 Log de depuración
-    console.log("✅ Respuesta de WordPress:", JSON.stringify(data, null, 2));
+    // Log de depuración
+    console.log("Respuesta de WordPress:", JSON.stringify(data, null, 2));
 
     const res = NextResponse.json(data, { status: 200 });
     res.headers.set('Access-Control-Allow-Origin', '*');
     return res;
 
   } catch (error) {
-    console.error("❌ Error al consultar contenido narrativo:", error);
+    console.error("Error al consultar contenido narrativo:", error);
     return NextResponse.json(
       { error: 'Error al consultar contenido narrativo' },
       { status: 500 }
