@@ -1,49 +1,74 @@
-export async function GET(request) {
+export default async function handler(req, res) {
+  const {
+    slug,
+    id,
+    type = 'posts',
+    search,
+    per_page = 10,
+    page = 1,
+    order = 'desc',
+    orderby = 'date',
+    post_status = 'any',
+  } = req.query;
+
+  const baseUrl = 'https://chileentinieblas.cl/wp-json/chileentinieblas/v1/contenido';
+
+  const url = new URL(baseUrl);
+  url.searchParams.set('type', type);
+  url.searchParams.set('per_page', per_page);
+  url.searchParams.set('page', page);
+  url.searchParams.set('order', order);
+  url.searchParams.set('orderby', orderby);
+  url.searchParams.set('post_status', post_status);
+
+  if (slug) url.searchParams.set('slug', slug);
+  if (id) url.searchParams.set('id', id);
+  if (search) url.searchParams.set('search', search);
+
   try {
-    const { searchParams } = new URL(request.url);
-    const search = searchParams.get('search');
-
-    const apiUrl = new URL('https://chileentinieblas.cl/wp-json/chileentinieblas/v1/contenido');
-    if (search) {
-      apiUrl.searchParams.set('search', search);
-    }
-
-    const headers = {};
-    const token = process.env.CHILE_TOKEN;
-    if (token) {
-      headers['Authorization'] = `Bearer ${token}`;
-      console.log('Token reenviado:', headers['Authorization']);  // Para debug
-    }
-
-    const response = await fetch(apiUrl.toString(), {
-      method: 'GET',
-      headers,
+    const response = await fetch(url.toString(), {
+      headers: {
+        Authorization: `Bearer ${process.env.WP_TOKEN}`,
+      },
     });
+
+    if (!response.ok) {
+      return res.status(response.status).json({ error: 'Error al consultar WordPress' });
+    }
 
     const data = await response.json();
 
-    // ✅ Log de depuración
-    console.log("Respuesta de WordPress:", JSON.stringify(data, null, 2));
+    // Si hay búsqueda flexible, aplicarla aquí
+    let results = data;
 
-    return new Response(JSON.stringify(data), {
-      status: 200,
-      headers: {
-        'Content-Type': 'application/json',
-        'Access-Control-Allow-Origin': '*',
-      }
-    });
+    if (search) {
+      const searchTerm = search.toLowerCase().trim();
+      results = data.filter((item) => {
+        const title = (item.title || '').toLowerCase();
+        const excerpt = (item.excerpt || '').toLowerCase();
+        const content = (item.content || '').toLowerCase();
+        const slug = (item.slug || '').toLowerCase();
 
-  } catch (error) {
-    console.error('Error al consultar contenido narrativo:', error);
-    return new Response(
-      JSON.stringify({ error: 'Error al consultar contenido narrativo' }),
-      {
-        status: 500,
-        headers: {
-          'Content-Type': 'application/json',
-          'Access-Control-Allow-Origin': '*',
-        }
-      }
-    );
+        const acf = item.acf || {};
+        const acfValues = [
+          acf.nombre,
+          acf.nombre_completo,
+          acf.alias,
+        ].map((v) => (v || '').toLowerCase());
+
+        return (
+          title.includes(searchTerm) ||
+          excerpt.includes(searchTerm) ||
+          content.includes(searchTerm) ||
+          slug.includes(searchTerm) ||
+          acfValues.some((val) => val.includes(searchTerm))
+        );
+      });
+    }
+
+    return res.status(200).json(results);
+  } catch (err) {
+    console.error('Error en handler contenido.js:', err);
+    return res.status(500).json({ error: 'Error interno del servidor' });
   }
 }
