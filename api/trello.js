@@ -30,7 +30,16 @@ export async function GET(request) {
     }
 
     const trelloRes = await fetch(url);
-    const data = await trelloRes.json();
+    const text = await trelloRes.text();
+    console.log('Respuesta Trello:', text);
+    
+    let data;
+    
+    try {
+      data = JSON.parse(text);
+    } catch {
+      data = { raw: text };
+    }
 
     return new Response(JSON.stringify(data), {
       status: 200,
