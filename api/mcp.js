@@ -1,19 +1,75 @@
-// Vercel: guardar este archivo como api/mcp.js.
-// Etapa 1: lectura. No contiene herramientas ni solicitudes de escritura.
+// Vercel: guardar como api/mcp.js.
+// Las credenciales se configuran exclusivamente en Environment Variables.
+
+import { createHash, timingSafeEqual } from 'node:crypto';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { z } from 'zod';
 
 const WP_BASE = 'https://chileentinieblas.cl';
+
 const READ = {
   readOnlyHint: true,
   destructiveHint: false,
   openWorldHint: false,
 };
 
-async function wpRead(path, params = {}, method = 'GET') {
-  if (!['GET', 'OPTIONS'].includes(method)) {
-    throw new Error('Solo se permite lectura.');
+const WRITE = {
+  readOnlyHint: false,
+  destructiveHint: false,
+  idempotentHint: false,
+  openWorldHint: false,
+};
+
+const TYPES = [
+  'post',
+  'pnj',
+  'agrupaciones',
+  'localidad',
+  'objeto-de-poder',
+  'mis_personajes',
+  'timeline_event',
+];
+
+const commonFields = {
+  title: z.string().max(1000).optional(),
+  content: z.string().max(300000).optional(),
+  excerpt: z.string().max(10000).optional(),
+  slug: z.string().max(200).optional(),
+  status: z.enum(['draft', 'pending', 'private', 'publish']).optional(),
+  featured_media: z.number().int().min(0).optional(),
+  acf: z.record(z.unknown()).optional(),
+};
+
+function validKey(req) {
+  const secret = process.env.CETGPT_MCP_KEY;
+
+  if (!secret || secret.length < 32) return false;
+
+  const url = new URL(
+    req.url,
+    'https://api-chileentinieblas.vercel.app'
+  );
+
+  const authorization = req.headers.authorization || '';
+
+  const supplied = authorization.startsWith('Bearer ')
+    ? authorization.slice(7)
+    : url.searchParams.get('key') || '';
+
+  const digest = (value) =>
+    createHash('sha256').update(value).digest();
+
+  return timingSafeEqual(digest(secret), digest(supplied));
+}
+
+async function wpRead(path, params = {}, method = 'GET', body) {
+  if (!['GET', 'OPTIONS', 'POST', 'DELETE'].includes(method)) {
+    throw new Error('Metodo no permitido.');
+  }
+
+  if (method === 'DELETE' && params.force !== false) {
+    throw new Error('Eliminacion permanente bloqueada.');
   }
 
   const user = process.env.WP_API_USER;
@@ -42,10 +98,12 @@ async function wpRead(path, params = {}, method = 'GET') {
         `${user}:${password}`
       ).toString('base64')}`,
       Accept: 'application/json',
+      ...(body ? { 'Content-Type': 'application/json' } : {}),
     },
     redirect: 'error',
     cache: 'no-store',
     signal: AbortSignal.timeout(15000),
+    ...(body ? { body: JSON.stringify(body) } : {}),
   });
 
   const text = await response.text();
@@ -63,7 +121,7 @@ async function wpRead(path, params = {}, method = 'GET') {
     throw new Error(
       `WordPress: HTTP ${response.status}; codigo ${
         data?.code || data?.error || 'error'
-      }.`
+      }. ${String(data?.message || '').slice(0, 800)}`
     );
   }
 
@@ -79,12 +137,10 @@ function asResult(data) {
     );
   }
 
-  return {
-    content: [{ type: 'text', text }],
-  };
+  return { content: [{ type: 'text', text }] };
 }
 
-function safeTool(fn) {
+function safeTool(fn, writing = false) {
   return async (args) => {
     try {
       return asResult(await fn(args));
@@ -94,11 +150,109 @@ function safeTool(fn) {
           ? 'WordPress tardo demasiado. Intenta una consulta mas pequena.'
           : error.message || 'No se pudo consultar WordPress.';
 
+      const note = writing
+        ? ' Si la solicitud alcanzo WordPress y se perdio la respuesta, puede haberse aplicado. Consulta la ficha antes de repetirla.'
+        : '';
+
       return {
         isError: true,
-        content: [{ type: 'text', text: message }],
+        content: [{ type: 'text', text: message + note }],
       };
     }
+  };
+}
+
+async function restRoute(type) {
+  if (!TYPES.includes(type)) {
+    throw new Error(
+      'Tipo de contenido no autorizado en esta integracion.'
+    );
+  }
+
+  const item = await wpRead(
+    `/wp-json/wp/v2/types/${encodeURIComponent(type)}`,
+    { context: 'edit' }
+  );
+
+  const namespace = item.rest_namespace || 'wp/v2';
+
+  if (
+    !/^[a-zA-Z0-9_/-]+$/.test(namespace) ||
+    !/^[a-zA-Z0-9_-]+$/.test(item.rest_base || '')
+  ) {
+    throw new Error('Ruta REST no compatible.');
+  }
+
+  return `/wp-json/${namespace}/${item.rest_base}`;
+}
+
+function mergeObjects(current, changes) {
+  const isObject = (x) =>
+    x !== null && typeof x === 'object' && !Array.isArray(x);
+
+  if (!isObject(current) || !isObject(changes)) return changes;
+
+  const result = { ...current };
+
+  for (const [key, value] of Object.entries(changes)) {
+    if (['__proto__', 'prototype', 'constructor'].includes(key)) {
+      throw new Error('Clave no permitida.');
+    }
+
+    result[key] = mergeObjects(current[key], value);
+  }
+
+  return result;
+}
+
+async function validateFields(route, fields, id) {
+  if (!Object.keys(fields).length) {
+    throw new Error('No se indicaron campos para modificar.');
+  }
+
+  const options = await wpRead(
+    id ? `${route}/${id}` : route,
+    {},
+    'OPTIONS'
+  );
+
+  const properties = options.schema?.properties;
+
+  if (!properties) {
+    throw new Error('WordPress no devolvio el esquema de campos.');
+  }
+
+  for (const key of Object.keys(fields)) {
+    if (
+      !Object.hasOwn(properties, key) ||
+      properties[key].readonly
+    ) {
+      throw new Error(`Campo no editable en este tipo: ${key}.`);
+    }
+  }
+
+  if (fields.acf) {
+    const available = properties.acf?.properties;
+
+    for (const key of Object.keys(fields.acf)) {
+      if (!available || !Object.hasOwn(available, key)) {
+        throw new Error(
+          `Campo ACF no expuesto para esta ficha: ${key}.`
+        );
+      }
+    }
+  }
+}
+
+function postSummary(post, fields = []) {
+  return {
+    id: post.id,
+    type: post.type,
+    status: post.status,
+    title: post.title?.raw ?? post.title?.rendered ?? post.title,
+    link: post.link,
+    modified_gmt: post.modified_gmt,
+    campos_enviados: fields,
   };
 }
 
@@ -114,11 +268,11 @@ function createServer() {
   const server = new McpServer(
     {
       name: 'cetgpt-wordpress',
-      version: '0.1.0',
+      version: '0.2.0',
     },
     {
       instructions:
-        'Fuente narrativa de Chile en Tinieblas. Consultar antes de afirmar canon. Esta version solo permite lectura. La busqueda habitual no busca dentro de ACF ni Elementor. Los campos reservados deben tratarse como informacion para narradores. Resolver IDs con buscarContenidoNarrativo antes de consultar fichas.',
+        'Fuente narrativa de Chile en Tinieblas. Consultar antes de afirmar canon. Resolver IDs y leer la ficha antes de editar. Escribir solo cuando el usuario lo solicite. Conservar campos no indicados. Crear como borrador por defecto. No repetir escrituras si su resultado es incierto: consultar primero. La busqueda habitual no busca dentro de ACF ni Elementor. Tratar campos reservados como informacion para narradores. No editar disenos de Elementor. Nunca eliminar permanentemente.',
     }
   );
 
@@ -131,10 +285,7 @@ function createServer() {
       inputSchema: {
         search: z.string().max(300).optional(),
         slug: z.string().max(200).optional(),
-        type: z
-          .string()
-          .regex(/^[a-zA-Z0-9_-]+$/)
-          .optional(),
+        type: z.string().regex(/^[a-zA-Z0-9_-]+$/).optional(),
         page: z.number().int().min(1).default(1),
         per_page: z.number().int().min(1).max(50).default(10),
       },
@@ -199,12 +350,30 @@ function createServer() {
         meta?._elementor_edit_mode?.[0] === 'builder' ||
         Boolean(
           datosElementor?.length &&
-            datosElementor[0] &&
-            datosElementor[0] !== '[]'
+          datosElementor[0] &&
+          datosElementor[0] !== '[]'
         );
+
+      let modified_gmt;
+
+      if (TYPES.includes(ficha.type)) {
+        try {
+          const route = await restRoute(ficha.type);
+
+          const native = await wpRead(`${route}/${id}`, {
+            context: 'edit',
+            _fields: 'id,modified_gmt',
+          });
+
+          modified_gmt = native.modified_gmt;
+        } catch {
+          // La lectura narrativa sigue disponible aunque no pueda editar.
+        }
+      }
 
       return {
         ...ficha,
+        modified_gmt,
         tiene_datos_elementor: tieneElementor,
         ...(incluir_elementor
           ? {
@@ -280,6 +449,189 @@ function createServer() {
     })
   );
 
+  server.registerTool(
+    'crearContenido',
+    {
+      title: 'Crear una publicacion o ficha',
+      description:
+        'Crea contenido cuando el usuario lo solicita. Por defecto crea un borrador atribuido a la cuenta CetGPT. Consulta el esquema ACF antes de enviar campos. No crea ni altera disenos de Elementor. No repetir ante un resultado incierto sin buscar primero la ficha.',
+      inputSchema: {
+        type: z.enum(TYPES),
+        ...commonFields,
+        title: z.string().trim().min(1).max(1000),
+        status: z.enum([
+          'draft',
+          'pending',
+          'private',
+          'publish',
+        ]).default('draft'),
+      },
+      annotations: WRITE,
+    },
+    safeTool(async ({ type, ...fields }) => {
+      const route = await restRoute(type);
+
+      await validateFields(route, fields);
+
+      const created = await wpRead(route, {}, 'POST', fields);
+
+      return postSummary(created, Object.keys(fields));
+    }, true)
+  );
+
+  server.registerTool(
+    'editarContenido',
+    {
+      title: 'Editar contenido y campos ACF',
+      description:
+        'Actualiza solo los campos indicados de una ficha previamente leida. Exige modified_gmt de esa lectura para detectar cambios posteriores. Conserva otros campos ACF y combina subcampos de grupos; las listas/repetidores enviados reemplazan la lista completa. No cambia el cuerpo de fichas que tengan diseno propio de Elementor. WordPress aplica los permisos del rol Narrador.',
+      inputSchema: {
+        type: z.enum(TYPES),
+        id: z.number().int().positive(),
+        expected_modified_gmt: z.string().min(1),
+        ...commonFields,
+      },
+      annotations: {
+        ...WRITE,
+        destructiveHint: true,
+      },
+    },
+    safeTool(
+      async ({ type, id, expected_modified_gmt, ...fields }) => {
+        const route = await restRoute(type);
+
+        const current = await wpRead(`${route}/${id}`, {
+          context: 'edit',
+        });
+
+        if (current.type !== type || current.status === 'trash') {
+          throw new Error(
+            'Tipo incorrecto o ficha en la papelera.'
+          );
+        }
+
+        if (current.modified_gmt !== expected_modified_gmt) {
+          throw new Error(
+            'La ficha cambio desde la ultima lectura. Lee nuevamente antes de editar.'
+          );
+        }
+
+        if (Object.hasOwn(fields, 'content')) {
+          const narrative = arrayResponse(
+            await wpRead('/wp-json/chileentinieblas/v1/contenido', {
+              id,
+              per_page: 1,
+            })
+          );
+
+          const post = narrative.find(
+            (item) => Number(item.id) === id
+          );
+
+          if (!post) {
+            throw new Error(
+              'No se pudo comprobar el contenido original.'
+            );
+          }
+
+          const meta = post.meta;
+
+          if (
+            meta?._elementor_edit_mode?.[0] === 'builder' ||
+            Boolean(
+              meta?._elementor_data?.[0] &&
+              meta._elementor_data[0] !== '[]'
+            )
+          ) {
+            throw new Error(
+              'Esta ficha tiene diseno propio de Elementor. Puedes editar ACF, pero su cuerpo requiere otra herramienta.'
+            );
+          }
+        }
+
+        await validateFields(route, fields, id);
+
+        if (fields.acf) {
+          const patch = {};
+
+          for (const [key, value] of Object.entries(fields.acf)) {
+            patch[key] = mergeObjects(current.acf?.[key], value);
+          }
+
+          fields.acf = patch;
+        }
+
+        const updated = await wpRead(
+          `${route}/${id}`,
+          {},
+          'POST',
+          fields
+        );
+
+        return postSummary(updated, Object.keys(fields));
+      },
+      true
+    )
+  );
+
+  server.registerTool(
+    'enviarAPapelera',
+    {
+      title: 'Enviar una publicacion a la papelera',
+      description:
+        'Envia a la papelera una publicacion identificada por ID cuando el usuario lo solicita. No permite force=true ni eliminacion permanente. Si la papelera no esta disponible, falla. Requiere fecha modified_gmt de la ultima lectura.',
+      inputSchema: {
+        type: z.enum(TYPES),
+        id: z.number().int().positive(),
+        expected_modified_gmt: z.string().min(1),
+      },
+      annotations: {
+        ...WRITE,
+        destructiveHint: true,
+      },
+    },
+    safeTool(async ({ type, id, expected_modified_gmt }) => {
+      const route = await restRoute(type);
+
+      const current = await wpRead(`${route}/${id}`, {
+        context: 'edit',
+      });
+
+      if (current.type !== type) {
+        throw new Error('Tipo de contenido incorrecto.');
+      }
+
+      if (current.status === 'trash') {
+        return {
+          id,
+          type,
+          status: 'trash',
+          ya_estaba_en_papelera: true,
+        };
+      }
+
+      if (current.modified_gmt !== expected_modified_gmt) {
+        throw new Error(
+          'La ficha cambio. Lee nuevamente antes de enviarla a la papelera.'
+        );
+      }
+
+      const trashed = await wpRead(
+        `${route}/${id}`,
+        { force: false },
+        'DELETE'
+      );
+
+      if (trashed.status !== 'trash') {
+        throw new Error(
+          'WordPress no confirmo el estado trash. Consulta el estado antes de repetir.'
+        );
+      }
+
+      return postSummary(trashed);
+    }, true)
+  );
+
   return server;
 }
 
@@ -308,6 +660,7 @@ export default async function handler(req, res) {
     'Access-Control-Allow-Headers',
     'Content-Type, Accept, MCP-Protocol-Version, Mcp-Session-Id'
   );
+
   res.setHeader(
     'Access-Control-Allow-Methods',
     'POST, GET, OPTIONS'
@@ -319,20 +672,42 @@ export default async function handler(req, res) {
     return;
   }
 
+  if (
+    !process.env.CETGPT_MCP_KEY ||
+    process.env.CETGPT_MCP_KEY.length < 32
+  ) {
+    res.statusCode = 503;
+    res.setHeader('Content-Type', 'application/json');
+
+    res.end(JSON.stringify({
+      error:
+        'Configura CETGPT_MCP_KEY con al menos 32 caracteres.',
+    }));
+    return;
+  }
+
+  if (!validKey(req)) {
+    res.statusCode = 401;
+    res.setHeader('Content-Type', 'application/json');
+
+    res.end(JSON.stringify({
+      error: 'Clave de conexion ausente o incorrecta.',
+    }));
+    return;
+  }
+
   if (req.method === 'GET') {
     res.setHeader('Allow', 'POST, OPTIONS');
     res.setHeader('Content-Type', 'application/json');
     res.statusCode = 405;
 
-    res.end(
-      JSON.stringify({
-        service: 'CetGPT WordPress MCP',
-        version: '0.1.0',
-        mode: 'read-only',
-        message:
-          'Ruta MCP disponible. Conectar mediante Streamable HTTP (POST). Este GET no verifica las credenciales de WordPress.',
-      })
-    );
+    res.end(JSON.stringify({
+      service: 'CetGPT WordPress MCP',
+      version: '0.2.0',
+      mode: 'read-write-trash',
+      message:
+        'Ruta MCP disponible. Conectar mediante Streamable HTTP (POST). Este GET no verifica las credenciales de WordPress.',
+    }));
     return;
   }
 
@@ -369,16 +744,14 @@ export default async function handler(req, res) {
       res.statusCode = 500;
       res.setHeader('Content-Type', 'application/json');
 
-      res.end(
-        JSON.stringify({
-          jsonrpc: '2.0',
-          id: null,
-          error: {
-            code: -32603,
-            message: 'No se pudo procesar la solicitud MCP.',
-          },
-        })
-      );
+      res.end(JSON.stringify({
+        jsonrpc: '2.0',
+        id: null,
+        error: {
+          code: -32603,
+          message: 'No se pudo procesar la solicitud MCP.',
+        },
+      }));
     }
   }
 }
