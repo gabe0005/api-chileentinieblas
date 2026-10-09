@@ -118,12 +118,13 @@ async function wpRead(path, params = {}, method = 'GET', body) {
   }
 
   if (!response.ok || data?.status === 'error') {
-    throw new Error(
-      `WordPress: HTTP ${response.status}; codigo ${
-        data?.code || data?.error || 'error'
-      }. ${String(data?.message || '').slice(0, 800)}`
-    );
-  }
+  throw new Error(
+    `WordPress: HTTP ${response.status}; codigo ${
+      data?.code || data?.error || 'error'
+    }. ${String(data?.message || '').slice(0, 800)} ` +
+    `Detalle: ${JSON.stringify(data?.data || {}).slice(0, 4000)}`
+  );
+}
 
   return data;
 }
